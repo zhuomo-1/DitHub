@@ -469,8 +469,8 @@ if __name__ == "__main__":
     parser.add_argument('--lora-alpha', type=float, default=8)
     parser.add_argument('--lora-dropout', type=float, default=0.0)
     parser.add_argument('--lora-out-min', type=int, default=128)
-    parser.add_argument('--lora-lr', type=float, default=1e-4)
-    parser.add_argument('--lora-weight-decay', type=float, default=0.0)
+    parser.add_argument('--lora-lr', type=float, default=0.001)
+    parser.add_argument('--lora-weight-decay', type=float, default=0.01)
 
     args = parser.parse_args()
 

@@ -3,6 +3,7 @@
 </p>
 
 ##
+This repository provides the official implementation of **DitHub**, accepted at NeurIPS 2025.
 
 **DitHub** is a modular and scalable framework designed for **Incremental Open-Vocabulary Object Detection**. Inspired by version control systems, DitHub enables the seamless management, update, and composition of **class-specific adaptation modules**.
 
@@ -127,7 +128,7 @@ If you find **DitHub** useful for your research, please consider citing our pape
 @article{cappellino2025dithub,
    title={DitHub: A Modular Framework for Incremental Open-Vocabulary Object Detection},
    author={Cappellino, Chiara and Mancusi, Gianluca and Mosconi, Matteo and Porrello, Angelo and Calderara, Simone and Cucchiara, Rita},
-   journal={arXiv preprint arXiv:2503.09271},
+   journal={Advances in Neural Information Processing Systems},
    year={2025}
  }
 

@@ -43,6 +43,19 @@ DitHub/
 
 ## 开发日志
 
+### [2026-02-25 --:--] 创建 CLAUDE.md 项目指南
+- **Status**: Completed
+- **Changes (变更详情)**:
+    - 📂 `File/Folder`: 新增 `CLAUDE.md` 文件
+    - ⚙️ `Function/API`: 无
+    - 🔧 `Tech`: 为 Claude Code 提供项目上下文指南
+- **Pitfalls & Solutions (踩坑与修复)**:
+    - 无
+- **Dev Notes (开发备忘/自由空间)**:
+    - CLAUDE.md 包含：常用命令、架构概览、核心类说明、训练流程、数据集结构
+    - 重点记录了 LoRA 注入机制（LinearPool）和 TaskMemory 单例管理
+    - 未来维护时注意：修改 LoRA 相关代码需同步更新文档
+
 ### [2026-02-25 --:--] 项目初始化
 - **Status**: Completed
 - **Changes (变更详情)**:

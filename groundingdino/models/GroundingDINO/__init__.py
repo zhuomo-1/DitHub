@@ -12,4 +12,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 # ------------------------------------------------------------------------
 
-from .groundingdino_dt import build_dt_groundingdino
+# 延迟导入: 避免在仅导入 ncrn 子包时触发
+# transformers/timm/detectron2 等重量级依赖链
+def build_dt_groundingdino(*args, **kwargs):
+    from .groundingdino_dt import build_dt_groundingdino as _build
+    return _build(*args, **kwargs)

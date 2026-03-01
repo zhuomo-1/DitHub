@@ -30,11 +30,18 @@ wget -q https://github.com/chiara-cap/DitHub/releases/download/v.0.1/model_final
 
 ### Training & Evaluation
 ```bash
-# Training on ODinW-13
+# Training on ODinW-13 (train-only to avoid NCCL timeout)
 sh train_dithub.sh
 
-# Evaluation
-sh eval_dithub.sh
+# Evaluation (use last_lora.pth)
+HF_HUB_OFFLINE=1 python -u main.py \
+    --config-file test/test_odinw13 \
+    --model-config-file groundingdino/config/GroundingDINO_SwinT_OGC_dt_dithub.py \
+    --model-checkpoint-path groundingdino_swint_ogc.pth \
+    --output-dir ./output/dithub_output \
+    --num-gpus 1 \
+    --dithub \
+    --eval-only
 ```
 
 ### Command-line Arguments (main.py)
@@ -45,7 +52,8 @@ sh eval_dithub.sh
 | `--model-checkpoint-path` | Pre-trained weights path |
 | `--output-dir` | Output directory for logs/checkpoints |
 | `--dithub` | Enable DitHub LoRA adaptation |
-| `--eval-only` | Run evaluation only |
+| `--eval-only` | Run evaluation only (skip training) |
+| `--train-only` | Skip evaluation during and after training |
 | `--shuffle-tasks` | Randomize task order |
 | `--lora-r`, `--lora-alpha`, `--lora-lr` | LoRA hyperparameters |
 
@@ -125,3 +133,54 @@ Uses detectron2's LazyConfig. Dataset configs in `test/test_odinw13/for_train/` 
 - **During training**: Saves `lora_final.pth` per task in `output_dir/<task_name>/`
 - **Final model**: `last_lora.pth` → merged into `model_final.pth`
 - **Evaluation**: `DetectionLoraCheckpointer` handles LoRA-only state dicts
+
+## Key Paths
+
+### Input/Output
+| Path | Description |
+|------|-------------|
+| `groundingdino_swint_ogc.pth` | Pre-trained GroundingDINO weights |
+| `./output/dithub_output/` | Training output directory |
+| `./output/dithub_output/last_lora.pth` | Latest trained LoRA weights (297MB) |
+| `./output/dithub_output/model_final.pth` | Merged model weights (811MB) |
+| `./output/dithub_output/odinw13/<dataset>_cet/` | Per-task output |
+| `./datasets/odinw13/` | ODinW-13 datasets |
+| `./datasets/coco/` | COCO dataset |
+
+### Logs
+| Path | Description |
+|------|-------------|
+| `./output/dithub_output/log.txt` | Training log |
+| `./output/dithub_output/eval_log.txt` | Evaluation log |
+
+### Environment Variables
+```bash
+export LD_LIBRARY_PATH=/opt/data/private/conda_envs/dithub/lib/python3.9/site-packages/torch/lib:$LD_LIBRARY_PATH
+export HF_HUB_OFFLINE=1
+```
+
+## Latest Results (2026-03-01)
+
+### Training
+- 13 tasks completed in ~9.5 hours
+- 29998 iterations total
+
+### Evaluation (using last_lora.pth)
+| Dataset | AP |
+|---------|-----|
+| CottontailRabbits | 70.29 |
+| Egohands | 68.25 |
+| NorthAmericaMushrooms | 49.32 |
+| Packages | 66.09 |
+| PascalVoc | 71.46 |
+| Raccoon | 72.24 |
+| ShellfishOpenImages | 41.21 |
+| VehiclesOpenImages | 67.53 |
+| AerialMaritimeDrone | 34.15 |
+| Aquarium | 42.84 |
+| Pistols | 72.02 |
+| Pothole | 50.41 |
+| thermalDogsAndPeople | 72.50 |
+
+- **Average AP**: 58.54
+- **COCO Zero-shot**: 45.83

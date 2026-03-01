@@ -271,12 +271,19 @@ def do_test(cfg, model, output_dir=None, eval_only=False):
                 model, instantiate(cfg.dataloader.test), cfg.dataloader.test.dataset.names, evaluator, output_dir=output_dir
             )
             print_csv_format(ret)
-        returns = {'bbox': ret['bbox']}
-        output_path = Path(cfg.train.output_dir).parent.parent / f'{cfg.dataloader.test.dataset.names}.out'
-        with open(output_path, 'a') as f:
-            f.write(f'{Path(cfg.train.output_dir).stem} {returns["bbox"]["AP"]}\n')
 
-        return returns
+            # Handle case where bbox key might not be present
+            if 'bbox' in ret:
+                returns = {'bbox': ret['bbox']}
+                output_path = Path(cfg.train.output_dir).parent.parent / f'{cfg.dataloader.test.dataset.names}.out'
+                with open(output_path, 'a') as f:
+                    f.write(f'{Path(cfg.train.output_dir).stem} {returns["bbox"]["AP"]}\n')
+                return returns
+            else:
+                logger.warning(f"Evaluation result does not contain 'bbox' key. Available keys: {ret.keys()}")
+                return ret
+        else:
+            return {}
     
     logger.info("Run evaluation without EMA.")
     if "evaluator" in cfg.dataloader:
@@ -294,7 +301,13 @@ def do_test(cfg, model, output_dir=None, eval_only=False):
                     )
                     print_csv_format(ema_ret)
                     ret.update(ema_ret)
-        return {'bbox': ret['bbox']}
+
+        # Handle case where bbox key might not be present
+        if 'bbox' in ret:
+            return {'bbox': ret['bbox']}
+        else:
+            logger.warning(f"Evaluation result does not contain 'bbox' key. Available keys: {ret.keys()}")
+            return ret
 
 def do_train(args, cfg):
     config_file = args.model_config_file 
@@ -305,6 +318,9 @@ def do_train(args, cfg):
     cfg.optimizer.params.model = model
     cfg.optimizer.weight_decay = args.lora_weight_decay
     cfg.optimizer.lr = args.lora_lr
+    # Remove unsupported lr_factor_func parameter (detectron2 v0.6 compatibility)
+    if hasattr(cfg.optimizer.params, 'lr_factor_func'):
+        delattr(cfg.optimizer.params, 'lr_factor_func')
     optim = instantiate(cfg.optimizer)
 
     train_loader = None
@@ -347,7 +363,9 @@ def do_train(args, cfg):
             PeriodicCheckpointer(checkpointer, **cfg.train.checkpointer, file_prefix='lora')
             if comm.is_main_process()
             else None,
-            hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model)),
+            hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model))
+            if not args.train_only and comm.is_main_process()
+            else None,
             hooks.PeriodicWriter(
                 writers,
                 period=cfg.train.log_period,
@@ -394,6 +412,13 @@ def main(args):
         if not args.eval_only:
             do_train(args, cfg)
 
+    if args.train_only:
+        logger.info("Training completed (train-only mode). Skipping evaluation.")
+        end_time = datetime.datetime.now()
+        elapsed_time = end_time - start_time
+        logger.info(f"Elapsed time: {elapsed_time}")
+        return
+
     coco_config_file = os.path.join(config_dirs, "test_zero_shot_coco.py")
 
     # eval
@@ -423,7 +448,8 @@ def main(args):
         ema.may_build_model_ema(cfg, model)
         if cfg.train.model_ema.enabled and cfg.train.model_ema.use_ema_weights_for_eval_only:
             ema.apply_model_ema(model)
-        json_path = os.path.join(os.path.join(args.output_dir, cfg.train.output_dir), "result.json")
+        # cfg.train.output_dir already contains the full path, don't concatenate again
+        json_path = os.path.join(cfg.train.output_dir, "result.json")
         json_paths[ow_config_file] = json_path
         res = do_test(cfg, model, args.output_dir, eval_only=True)
         with open(json_path, "w") as jf:
@@ -445,7 +471,13 @@ def main(args):
             sum_ += v
         else:
             coco_count += 1
-    logger.info(f"average AP: {sum_ / (len(avg_res) - coco_count)}")
+
+    # Handle case when avg_res is empty to avoid division by zero
+    if len(avg_res) - coco_count > 0:
+        logger.info(f"average AP: {sum_ / (len(avg_res) - coco_count)}")
+    else:
+        logger.info("No valid AP results to compute average")
+
     if coco_config_file in avg_res:
         logger.info(f"AP on COCO: {avg_res[coco_config_file]}")
 
@@ -464,6 +496,7 @@ if __name__ == "__main__":
     parser.add_argument("--zero-shot", action="store_true", help="perform shuffle tasks only")
 
     parser.add_argument("--dithub", action="store_true", default=False)
+    parser.add_argument("--train-only", action="store_true", default=False, help="skip evaluation during and after training")
 
     parser.add_argument('--lora-r', type=int, default=8)
     parser.add_argument('--lora-alpha', type=float, default=8)

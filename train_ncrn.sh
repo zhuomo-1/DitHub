@@ -22,7 +22,7 @@ echo "   GPUs:   ${NUM_GPUS}"
 echo ""
 
 python -u main_ncrn.py \
-    --config-file test/test_odinw13 \
+    --config-file test/test_odinw13_10shot \
     --model-config-file groundingdino/config/GroundingDINO_SwinT_OGC_dt_ncrn.py \
     --model-checkpoint-path "${CHECKPOINT}" \
     --output-dir "${OUTPUT_DIR}" \

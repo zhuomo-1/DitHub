@@ -68,6 +68,7 @@ class NCRN_Head(nn.Module):
             max_concepts=total_concepts,
             num_classes=num_classes,
             num_rules=num_rules,
+            init_k_active=init_active,
         )
 
         # 记录增量学习步骤
@@ -81,22 +82,16 @@ class NCRN_Head(nn.Module):
     def num_classes(self) -> int:
         return self.dnf.num_classes
 
-    def forward(self, Z: torch.Tensor) -> torch.Tensor:
-        """
-        前向推理
-        
-        Args:
-            Z: ROI 连续特征 [B, D]
-        
-        Returns:
-            Y_hat: 类别概率 [B, C_total]，值域 (0, 1)
-        """
-        # Step 1: 概念投影
+    def forward(self, Z: torch.Tensor, return_intermediates: bool = False):
         C = self.concept_dict(Z)  # [B, K_active]
 
-        # Step 2: DNF 逻辑推理
-        Y_hat = self.dnf(C, self.K_active)  # [B, C_total]
+        if return_intermediates:
+            Y_hat, dnf_info = self.dnf(C, self.K_active, return_intermediates=True)
+            dnf_info["C"] = C
+            dnf_info["Z"] = Z
+            return Y_hat, dnf_info
 
+        Y_hat = self.dnf(C, self.K_active)
         return Y_hat
 
     def compute_loss(
@@ -114,7 +109,7 @@ class NCRN_Head(nn.Module):
         Returns:
             dict: {
                 'L_BCE': 分类损失,
-                'L_L1': 稀疏惩罚,
+                'L_sparse': 稀疏惩罚,
                 'L_conflict': 互斥惩罚,
                 'L_total': 总损失,
                 'Y_hat': 预测概率,
@@ -140,7 +135,7 @@ class NCRN_Head(nn.Module):
 
         return {
             "L_BCE": L_BCE,
-            "L_L1": logic_loss["L_L1"],
+            "L_sparse": logic_loss["L_sparse"],
             "L_conflict": logic_loss["L_conflict"],
             "L_total": L_total,
             "Y_hat": Y_hat,
@@ -182,7 +177,7 @@ class NCRN_Head(nn.Module):
 
         # Step 3: 扩展 DNF 的类别数
         num_new_classes = Y_new.shape[1] if Y_new.dim() > 1 else 1
-        self.dnf.expand_classes(num_new_classes)
+        self.dnf.expand_classes(num_new_classes, current_k_active=self.K_active)
         info["new_classes"] = num_new_classes
         info["total_classes"] = self.num_classes
 

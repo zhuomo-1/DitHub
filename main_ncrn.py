@@ -31,6 +31,7 @@ import time
 import traceback
 from pathlib import Path
 
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -199,8 +200,12 @@ def load_grounding_dino(model_config_path, model_checkpoint_path, output_dir,
 # Shared NCRN checkpoint save/load
 # ============================================================
 
-def save_ncrn_shared(ncrn_head, all_class_names, output_dir):
-    """Save NCRN shared checkpoint with all state needed for continual learning."""
+def save_ncrn_shared(ncrn_head, class_registry, output_dir):
+    """Save NCRN shared checkpoint with all state needed for continual learning.
+    
+    class_registry: list of (task_idx, [class_names]) — tracks which global class
+    indices belong to which task, resolving duplicate class names across tasks.
+    """
     ckpt_path = os.path.join(output_dir, SHARED_CKPT_NAME)
     os.makedirs(output_dir, exist_ok=True)
     torch.save({
@@ -208,11 +213,12 @@ def save_ncrn_shared(ncrn_head, all_class_names, output_dir):
         'K_active': ncrn_head.K_active,
         'num_classes': ncrn_head.num_classes,
         'task_count': ncrn_head._task_count,
-        'all_class_names': all_class_names,
+        'class_registry': class_registry,
     }, ckpt_path)
+    all_names = [n for _, names in class_registry for n in names]
     logger.info(f"Shared NCRN checkpoint saved: {ckpt_path}")
     logger.info(f"  K_active={ncrn_head.K_active}, num_classes={ncrn_head.num_classes}, "
-                f"task_count={ncrn_head._task_count}, classes={all_class_names}")
+                f"task_count={ncrn_head._task_count}, classes={all_names}")
 
 
 def load_ncrn_shared(output_dir, ncrn_cfg):
@@ -223,8 +229,12 @@ def load_ncrn_shared(output_dir, ncrn_cfg):
 
     ckpt = torch.load(ckpt_path, map_location="cuda")
     logger.info(f"Loading shared NCRN checkpoint: {ckpt_path}")
+    class_registry = ckpt.get('class_registry', [])
+    if not class_registry and 'all_class_names' in ckpt:
+        class_registry = [(0, ckpt['all_class_names'])]
+    all_names = [n for _, names in class_registry for n in names]
     logger.info(f"  K_active={ckpt['K_active']}, num_classes={ckpt['num_classes']}, "
-                f"task_count={ckpt['task_count']}, classes={ckpt['all_class_names']}")
+                f"task_count={ckpt['task_count']}, classes={all_names}")
 
     ncrn_head = NCRN_Head(
         feat_dim=getattr(ncrn_cfg, 'ncrn_feat_dim', 256),
@@ -239,7 +249,7 @@ def load_ncrn_shared(output_dir, ncrn_cfg):
     ncrn_head.load_state_dict(ckpt['ncrn_head'])
     ncrn_head._task_count = ckpt['task_count']
 
-    return ncrn_head, ckpt['all_class_names']
+    return ncrn_head, class_registry
 
 
 def create_fresh_ncrn(ncrn_cfg, num_classes):
@@ -395,7 +405,7 @@ class NCRNTrainer:
         self.train_box_loss = train_box_loss
         self.iter = 0
         self.max_iter = cfg.train.max_iter
-        self.cls_weight = 2.0
+        self.cls_weight = 1.0
         self.box_weight = 5.0
         self.giou_weight = 2.0
 
@@ -411,7 +421,15 @@ class NCRNTrainer:
         num_classes = self.ncrn_head.num_classes
 
         Z = hs_last.reshape(B * nq, D)
-        Y_hat = self.ncrn_head(Z).reshape(B, nq, -1)
+
+        do_diag = (self.iter % 50 == 0)
+        if do_diag:
+            Y_hat_flat, intermediates = self.ncrn_head(Z, return_intermediates=True)
+        else:
+            Y_hat_flat = self.ncrn_head(Z)
+            intermediates = None
+
+        Y_hat = Y_hat_flat.reshape(B, nq, -1)
 
         outputs = {"pred_logits": Y_hat, "pred_boxes": pred_boxes}
         indices = self.matcher(outputs, targets)
@@ -432,7 +450,7 @@ class NCRNTrainer:
         target_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
         target_onehot = target_onehot[:, :, :-1]
 
-        loss_cls = sigmoid_focal_loss(Y_logits, target_onehot, num_boxes) * Y_logits.shape[1]
+        loss_cls = sigmoid_focal_loss(Y_logits, target_onehot, num_boxes)
 
         loss_bbox = torch.tensor(0.0, device=self.device)
         loss_giou = torch.tensor(0.0, device=self.device)
@@ -451,8 +469,17 @@ class NCRNTrainer:
         self.optimizer.zero_grad()
         L_total.backward()
         self.ncrn_head.apply_gradient_mask()
-        torch.nn.utils.clip_grad_norm_(self.ncrn_head.parameters(), max_norm=0.1)
+
+        grad_norm_before = torch.nn.utils.clip_grad_norm_(
+            self.ncrn_head.parameters(), max_norm=1.0)
         self.optimizer.step()
+
+        if do_diag:
+            self._log_diagnostics(
+                Z, Y_hat, Y_logits, intermediates,
+                indices, targets, num_boxes, B, nq,
+                grad_norm_before,
+            )
 
         return {
             "loss_cls": loss_cls.item(),
@@ -462,6 +489,109 @@ class NCRNTrainer:
             "loss_total": L_total.item(),
         }
 
+    @torch.no_grad()
+    def _log_diagnostics(self, Z, Y_hat, Y_logits, intermediates,
+                         indices, targets, num_boxes, B, nq,
+                         grad_norm_before):
+        """Print comprehensive layer-by-layer diagnostics."""
+        C = intermediates["C"]
+        L = intermediates["L"]
+        W = intermediates["W"]
+        P_rules = intermediates["P_rules"]
+        omega_active = intermediates["omega_active"]
+        sig_omega = torch.sigmoid(omega_active)
+
+        lines = [f"\n{'='*60} DIAGNOSTICS iter={self.iter} {'='*60}"]
+
+        # --- Layer 1: Input features Z ---
+        lines.append(f"[L1 Z] shape={list(Z.shape)} "
+                      f"min={Z.min():.4f} max={Z.max():.4f} "
+                      f"mean={Z.mean():.4f} std={Z.std():.4f}")
+
+        # --- Layer 2: Concept activations C ---
+        q5, q25, q50, q75, q95 = torch.quantile(
+            C.float(), torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95], device=C.device))
+        concept_means = C.mean(dim=0)
+        lines.append(f"[L2 C] shape={list(C.shape)} "
+                      f"min={C.min():.4f} max={C.max():.4f} "
+                      f"mean={C.mean():.4f} std={C.std():.4f}")
+        lines.append(f"  quantiles: 5%={q5:.4f} 25%={q25:.4f} 50%={q50:.4f} "
+                      f"75%={q75:.4f} 95%={q95:.4f}")
+        lines.append(f"  per-concept-mean std={concept_means.std():.4f} "
+                      f"(low=no differentiation)")
+
+        # --- Layer 3: STE mask W / sigmoid(Omega) ---
+        active_ratio = W.sum().item() / W.numel()
+        per_rule_active = W.sum(dim=-1).mean().item()
+        total_lits = W.shape[-1]
+
+        bins = [(0, 0.1), (0.1, 0.4), (0.4, 0.6), (0.6, 0.9), (0.9, 1.0)]
+        sig_flat = sig_omega.flatten()
+        bin_str = " ".join(
+            f"[{lo}-{hi}]:{((sig_flat>=lo)&(sig_flat<hi)).sum().item()}"
+            for lo, hi in bins)
+
+        lines.append(f"[L3 W] shape={list(W.shape)} "
+                      f"active_ratio={active_ratio:.4f} "
+                      f"per_rule_active={per_rule_active:.1f}/{total_lits}")
+        lines.append(f"  sig(Omega) mean={sig_omega.mean():.4f} "
+                      f"distribution: {bin_str}")
+
+        # --- Layer 4: Rule outputs P_rules ---
+        lines.append(f"[L4 P_rules] shape={list(P_rules.shape)} "
+                      f"min={P_rules.min():.4f} max={P_rules.max():.4f} "
+                      f"mean={P_rules.mean():.4f} std={P_rules.std():.4f}")
+
+        # --- Layer 5: Final output Y_hat ---
+        Y_flat = Y_hat.reshape(-1, Y_hat.shape[-1])
+        lines.append(f"[L5 Y_hat] shape={list(Y_hat.shape)} "
+                      f"min={Y_hat.min():.4f} max={Y_hat.max():.4f} "
+                      f"mean={Y_hat.mean():.4f} std={Y_hat.std():.4f}")
+
+        idx = self._get_src_permutation_idx(indices)
+        if idx[0].numel() > 0:
+            target_cls = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+            matched_yhat = Y_hat[idx[0], idx[1]]  # [num_matched, C]
+            pos_probs = matched_yhat[torch.arange(len(target_cls)), target_cls]
+            neg_mask = torch.ones_like(matched_yhat, dtype=torch.bool)
+            neg_mask[torch.arange(len(target_cls)), target_cls] = False
+            neg_probs = matched_yhat[neg_mask]
+
+            lines.append(f"  matched_queries={idx[0].numel()}/{B*nq} "
+                          f"pos_prob: mean={pos_probs.mean():.4f} "
+                          f"min={pos_probs.min():.4f} max={pos_probs.max():.4f}")
+            lines.append(f"  neg_prob (matched queries, wrong classes): "
+                          f"mean={neg_probs.mean():.4f} "
+                          f"min={neg_probs.min():.4f} max={neg_probs.max():.4f}")
+
+            unmatched_mask = torch.ones(B, nq, dtype=torch.bool, device=Y_hat.device)
+            unmatched_mask[idx[0], idx[1]] = False
+            unmatched_yhat = Y_hat[unmatched_mask]
+            if unmatched_yhat.numel() > 0:
+                lines.append(f"  unmatched_queries Y_hat: "
+                              f"mean={unmatched_yhat.mean():.4f} "
+                              f"min={unmatched_yhat.min():.4f} "
+                              f"max={unmatched_yhat.max():.4f}")
+
+        # --- Layer 6: Loss & gradients ---
+        lines.append(f"[L6 logits] "
+                      f"min={Y_logits.min():.2f} max={Y_logits.max():.2f} "
+                      f"mean={Y_logits.mean():.2f} std={Y_logits.std():.2f}")
+        lines.append(f"  num_boxes={num_boxes} total_queries={B*nq} "
+                      f"ratio=1:{B*nq//max(num_boxes,1)}")
+
+        omega_grad = self.ncrn_head.dnf.Omega.grad
+        ptotal_grad = self.ncrn_head.concept_dict.P_total.grad
+        gnb = grad_norm_before.item() if torch.is_tensor(grad_norm_before) else float(grad_norm_before)
+        ogn = omega_grad.norm().item() if omega_grad is not None else 0.0
+        pgn = ptotal_grad.norm().item() if ptotal_grad is not None else 0.0
+        lines.append(f"  grad_norm_before_clip={gnb:.4f} "
+                      f"Omega.grad.norm={ogn:.6f} "
+                      f"P_total.grad.norm={pgn:.6f}")
+
+        lines.append("=" * 130)
+        logger.info("\n".join(lines))
+
     @staticmethod
     def _get_src_permutation_idx(indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -469,8 +599,8 @@ class NCRNTrainer:
         return batch_idx, src_idx
 
     def train(self):
-        data_iter = iter(self.dataloader)
         logger.info(f"Starting NCRN training for {self.max_iter} iterations")
+        data_iter = iter(self.dataloader)
         self.ncrn_head.train()
         skip_count = 0
 
@@ -505,11 +635,55 @@ class NCRNTrainer:
 # ============================================================
 
 class NCRNInferenceModel(nn.Module):
-    def __init__(self, grounding_dino, ncrn_head):
+    def __init__(self, grounding_dino, ncrn_head, class_registry=None):
         super().__init__()
         self.gd = grounding_dino
         self.ncrn_head = ncrn_head
         self.ncrn_head.eval()
+        self.class_registry = class_registry or []
+        self._task_class_indices = None
+
+    def set_eval_task(self, task_categories):
+        """Set which task's classes to evaluate; maps global → local IDs.
+        
+        Uses class_registry (list of (task_idx, [names])) to resolve
+        duplicate class names across tasks by finding the best matching
+        task block.
+        """
+        if not task_categories or not self.class_registry:
+            self._task_class_indices = None
+            return
+
+        task_cats_lower = [c.lower() for c in task_categories]
+        best_block = None
+        best_overlap = 0
+        global_offset = 0
+        for _, block_names in self.class_registry:
+            block_lower = [n.lower() for n in block_names]
+            overlap = len(set(task_cats_lower) & set(block_lower))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_block = (global_offset, block_lower)
+            global_offset += len(block_names)
+
+        if best_block is None:
+            self._task_class_indices = None
+            return
+
+        offset, block_lower = best_block
+        indices = []
+        for cat_l in task_cats_lower:
+            if cat_l in block_lower:
+                indices.append(offset + block_lower.index(cat_l))
+            else:
+                for gi_off, (_, bn) in enumerate(self.class_registry):
+                    bn_lower = [n.lower() for n in bn]
+                    if cat_l in bn_lower:
+                        prev_offset = sum(len(names) for _, names in self.class_registry[:gi_off])
+                        indices.append(prev_offset + bn_lower.index(cat_l))
+                        break
+        self._task_class_indices = indices if indices else None
+        logger.info(f"Eval task class mapping: {list(zip(task_categories, self._task_class_indices or []))}")
 
     @property
     def device(self):
@@ -524,6 +698,10 @@ class NCRNInferenceModel(nn.Module):
         with torch.no_grad():
             Z = hs_last.reshape(B * nq, D)
             Y_hat = self.ncrn_head(Z).reshape(B, nq, -1)
+
+        if self._task_class_indices is not None:
+            idx = torch.tensor(self._task_class_indices, device=Y_hat.device)
+            Y_hat = Y_hat[:, :, idx]
 
         pred_logits = torch.log(
             Y_hat.clamp(1e-7, 1 - 1e-7) / (1 - Y_hat.clamp(1e-7, 1 - 1e-7))
@@ -628,10 +806,10 @@ def do_single_task_train(args):
     if task_idx == 0:
         logger.info(f"First task: creating fresh NCRN_Head with {num_classes_task} classes")
         ncrn_head = create_fresh_ncrn(ncrn_cfg, num_classes_task)
-        all_class_names = []
+        class_registry = []
     else:
         logger.info(f"Task {task_idx}: loading shared NCRN checkpoint...")
-        ncrn_head, all_class_names = load_ncrn_shared(args.output_dir, ncrn_cfg)
+        ncrn_head, class_registry = load_ncrn_shared(args.output_dir, ncrn_cfg)
         if ncrn_head is None:
             raise RuntimeError(f"No shared checkpoint found at {args.output_dir}/{SHARED_CKPT_NAME} "
                              f"but task_index={task_idx} > 0!")
@@ -650,17 +828,20 @@ def do_single_task_train(args):
 
     # DataLoader (num_workers=0 to avoid mmap issues with max_map_count=65530)
     cfg.dataloader.train.num_workers = 0
-    train_loader = instantiate(cfg.dataloader.train)
 
     # Incremental update for task_idx > 0
+    # Use a separate DataLoader instance for sampling features,
+    # then create the training DataLoader fresh (avoids re-iter deadlock
+    # in detectron2's ToIterableDataset).
     if task_idx > 0:
         logger.info("Performing incremental update for new task...")
+        sample_loader = instantiate(cfg.dataloader.train)
         sample_features = []
         sample_count = 0
-        temp_iter = iter(train_loader)
+        sample_iter = iter(sample_loader)
         for _ in range(20):
             try:
-                data = next(temp_iter)
+                data = next(sample_iter)
             except StopIteration:
                 break
             hs_tmp, _, _, _, _, _, _ = extract_features(gd_model, data, torch.device("cuda"))
@@ -670,7 +851,7 @@ def do_single_task_train(args):
                 sample_count += feat.shape[0]
             if sample_count >= 50:
                 break
-        del temp_iter
+        del sample_iter, sample_loader
         torch.cuda.empty_cache()
 
         if sample_features:
@@ -684,19 +865,24 @@ def do_single_task_train(args):
         else:
             logger.warning("No features collected for incremental update!")
 
-    # Track class names
-    all_class_names.extend(categories_names)
+    train_loader = instantiate(cfg.dataloader.train)
+
+    # Track class names per task (avoids duplicate name collisions)
+    class_registry.append((task_idx, list(categories_names)))
 
     # Matcher
     matcher = NCRNHungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0).to("cuda")
 
     # Optimizer
-    ncrn_params = [p for p in ncrn_head.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        ncrn_params,
-        lr=getattr(ncrn_cfg, 'ncrn_lr', 0.001),
-        weight_decay=getattr(ncrn_cfg, 'ncrn_weight_decay', 0.01),
-    )
+    base_lr = getattr(ncrn_cfg, 'ncrn_lr', 0.001)
+    omega_id = id(ncrn_head.dnf.Omega)
+    omega_params = [ncrn_head.dnf.Omega]
+    other_params = [p for p in ncrn_head.parameters()
+                    if p.requires_grad and id(p) != omega_id]
+    optimizer = torch.optim.AdamW([
+        {"params": omega_params, "lr": base_lr * 10.0},
+        {"params": other_params, "lr": base_lr},
+    ], weight_decay=getattr(ncrn_cfg, 'ncrn_weight_decay', 0.01))
 
     TaskMemory().current_task = cfg.dataloader.train.dataset.names.split('_')[0].lower()
 
@@ -716,11 +902,8 @@ def do_single_task_train(args):
         logger.error(f"Training failed:\n{traceback.format_exc()}")
         raise
 
-    del trainer, optimizer, train_loader
-    torch.cuda.empty_cache()
-
     peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
-    logger.info(f"Task {task_idx} finished. GPU peak memory: {peak_mem:.0f} MB")
+    logger.info(f"Task {task_idx} training finished. GPU peak memory: {peak_mem:.0f} MB")
 
     TaskMemory().end_task()
 
@@ -732,14 +915,17 @@ def do_single_task_train(args):
         'K_active': ncrn_head.K_active,
         'num_classes': ncrn_head.num_classes,
         'task_count': ncrn_head._task_count,
-        'all_class_names': all_class_names,
+        'class_registry': class_registry,
     }, task_ckpt_path)
     logger.info(f"Task checkpoint saved: {task_ckpt_path}")
 
-    # Update shared checkpoint
-    save_ncrn_shared(ncrn_head, all_class_names, args.output_dir)
+    # Update shared checkpoint for next task
+    save_ncrn_shared(ncrn_head, class_registry, args.output_dir)
 
-    logger.info(f"Task {task_idx} complete. Process will exit cleanly.")
+    all_names = [n for _, names in class_registry for n in names]
+    logger.info(f"Task {task_idx} complete (K_active={ncrn_head.K_active}, "
+                f"num_classes={ncrn_head.num_classes}, classes={all_names}). "
+                f"Process will exit — OS reclaims all GPU/CPU/mmap resources.")
 
 
 # ============================================================
@@ -759,7 +945,7 @@ def do_eval_all(args):
     ncrn_cfg = SLConfig.fromfile(args.model_config_file)
 
     # Load shared NCRN checkpoint
-    ncrn_head, all_class_names = load_ncrn_shared(args.output_dir, ncrn_cfg)
+    ncrn_head, class_registry = load_ncrn_shared(args.output_dir, ncrn_cfg)
     if ncrn_head is None:
         # Try ncrn_final.pth fallback
         final_path = os.path.join(args.output_dir, "ncrn_final.pth")
@@ -770,8 +956,12 @@ def do_eval_all(args):
             ncrn_head.concept_dict.K_active = ckpt['K_active']
             ncrn_head.load_state_dict(ckpt['ncrn_head'])
             ncrn_head._task_count = ckpt['task_count']
+            class_registry = ckpt.get('class_registry', [])
         else:
             raise RuntimeError("No NCRN checkpoint found for evaluation!")
+
+    if TaskMemory().task_mapping is None:
+        TaskMemory().task_mapping = {}
 
     gd_model = load_grounding_dino(
         args.model_config_file,
@@ -780,7 +970,7 @@ def do_eval_all(args):
         eval_mode=True,
     )
     gd_model.to("cuda")
-    inference_model = NCRNInferenceModel(gd_model, ncrn_head).to("cuda")
+    inference_model = NCRNInferenceModel(gd_model, ncrn_head, class_registry).to("cuda")
     inference_model.eval()
 
     config_dirs_base = args.config_file
@@ -797,6 +987,11 @@ def do_eval_all(args):
         cfg = LazyConfig.apply_overrides(cfg, args.opts)
         cfg.train.output_dir = os.path.join(args.output_dir, cfg.train.output_dir)
         default_setup(cfg, args)
+
+        task_categories = cfg.dataloader.train.mapper.categories_names
+        inference_model.set_eval_task(task_categories)
+        logger.info(f"Evaluating {Path(eval_config_file).stem}: "
+                     f"local classes={task_categories}")
 
         json_path = os.path.join(cfg.train.output_dir, "result.json")
         json_paths[eval_config_file] = json_path

@@ -36,27 +36,20 @@ class FuzzyLogicOperators:
         """
         对数空间乘积三角模 (合取 / AND)
         
-        公式: exp(sum(W · log(L + ε)))
+        公式: exp(sum(W · log(L + ε)) / num_active)
         
-        等价于加权乘积 prod(L^W)，但在对数空间中以加法实现，
-        避免多个小于1的值连乘导致下溢出。
-        
-        Args:
-            literals: 文字真值 [B, 2K] 或 [..., N]，值域 (0, 1)
-            weights:  逻辑掩码 [..., N]，值域 [0, 1] (经过 STE 后为 0/1)
-            eps:      数值护栏，防止 log(0)
-        
-        Returns:
-            合取结果，形状取决于聚合维度
+        Empty rules (num_active=0) output 0 instead of 1 to prevent
+        the OR gate from being saturated by vacuously true rules.
         """
-        # 数值护栏: clamp 到 (eps, 1) 防止 log(0)
         L_safe = literals.clamp(min=eps, max=1.0)
-        
-        # 对数空间乘积: exp(sum(W · log(L)))
-        log_L = torch.log(L_safe)                    # [..., N]
-        weighted_log = weights * log_L                 # [..., N]
-        result = torch.exp(weighted_log.sum(dim=-1))   # [...]
-        
+
+        log_L = torch.log(L_safe)
+        weighted_log = weights * log_L
+        log_sum = weighted_log.sum(dim=-1)
+
+        num_active = weights.sum(dim=-1).clamp(min=1.0)
+        result = torch.exp(log_sum / num_active)
+
         return result
 
     @staticmethod

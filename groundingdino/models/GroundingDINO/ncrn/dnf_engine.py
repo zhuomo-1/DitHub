@@ -59,24 +59,40 @@ class DifferentiableDNF(nn.Module):
         num_classes: int = 10,
         num_rules: int = 8,
         init_scale: float = 0.01,
+        init_active_per_rule: int = 2,
+        init_k_active: int = 64,
     ):
         super().__init__()
         self.max_concepts = max_concepts  # M
         self.num_classes = num_classes    # C_total
         self.num_rules = num_rules       # R
         self.init_scale = init_scale
+        self.init_active_per_rule = init_active_per_rule
+        self.init_k_active = init_k_active
 
-        # 逻辑权重掩码 Ω ∈ R^{C_total × R × 2M}
-        # 使用 2M 是因为双极性扩展 (正/负文字)
         self.Omega = nn.Parameter(
-            torch.randn(num_classes, num_rules, 2 * max_concepts) * init_scale
+            self._sparse_init_omega(num_classes, num_rules, 2 * max_concepts,
+                                    init_active_per_rule,
+                                    active_range=2 * init_k_active)
         )
 
-        # 冻结掩码: 标记哪些类别的 Omega 行已冻结 (旧类别)
         self.register_buffer(
             "frozen_class_mask",
             torch.zeros(num_classes, dtype=torch.bool),
         )
+
+    @staticmethod
+    def _sparse_init_omega(C, R, num_lits, active_per_rule=2, active_range=None):
+        """Sparse deterministic init: each rule binds a few random literals at +3
+        (within the active_range dims), all others at -3."""
+        if active_range is None:
+            active_range = num_lits
+        omega = torch.full((C, R, num_lits), -3.0)
+        for c in range(C):
+            for r in range(R):
+                idx = torch.randperm(active_range)[:active_per_rule]
+                omega[c, r, idx] = 3.0
+        return omega
 
     def _bipolar_expand(self, C: torch.Tensor) -> torch.Tensor:
         """
@@ -87,59 +103,47 @@ class DifferentiableDNF(nn.Module):
         """
         return torch.cat([C, 1.0 - C], dim=-1)  # [B, 2K]
 
-    def _binary_ste(self, omega: torch.Tensor) -> torch.Tensor:
-        """
-        Binary STE 离散化
-        
-        前向: W = (σ(Ω) > 0.5).float()  — 稀疏布尔掩码
-        反向: 连续的 Sigmoid 梯度
-        
-        实现: W = STE(σ(Ω)) = (σ(Ω)>0.5).float() - σ(Ω).detach() + σ(Ω)
-        """
+    def _get_w(self, omega: torch.Tensor) -> torch.Tensor:
+        """Binary STE: hard 0/1 forward, sigmoid gradient backward."""
         sig = torch.sigmoid(omega)
-        return BinarySTE.apply(sig) - sig.detach() + sig
+        hard = (sig > 0.5).float()
+        return hard - sig.detach() + sig
+
+    def set_annealing_progress(self, progress: float):
+        """Set training progress in [0, 1] for STE annealing.
+        beta ramps from 1.0 to 10.0 over training."""
+        self._current_beta = 1.0 + 9.0 * min(max(progress, 0.0), 1.0)
 
     def forward(
         self,
         C: torch.Tensor,
         K_active: int,
-    ) -> torch.Tensor:
-        """
-        DNF 前向推理
-        
-        Args:
-            C: 概念激活值 [B, K_active]，来自 OrthogonalConceptDict
-            K_active: 当前激活概念数
-        
-        Returns:
-            Y_hat: 类别概率 [B, C_total]
-        """
+        return_intermediates: bool = False,
+    ):
         B = C.shape[0]
-        
-        # Step 1: 双极性扩展
-        L = self._bipolar_expand(C)  # [B, 2*K_active]
 
-        # Step 2: 截取活跃维度的 Omega 并 STE 离散化
-        # Omega[:, :, :2*K_active] → 仅使用与当前激活概念对应的部分
-        omega_active = self.Omega[:, :, :2 * K_active]  # [C, R, 2K]
-        W = self._binary_ste(omega_active)               # [C, R, 2K]
+        L = self._bipolar_expand(C)
 
-        # Step 3: 合取 (AND over literals within each rule)
-        # 对每条规则：LogSpaceAnd(L, W)
-        # L: [B, 2K] → 扩展为 [B, 1, 1, 2K] 以便广播
-        # W: [C, R, 2K]
-        L_expanded = L.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, 2K]
-        W_expanded = W.unsqueeze(0)                # [1, C, R, 2K]
+        omega_active = self.Omega[:, :, :2 * K_active]
+        W = self._get_w(omega_active)
 
-        # 对数空间合取
+        L_expanded = L.unsqueeze(1).unsqueeze(1)
+        W_expanded = W.unsqueeze(0)
+
         P_rules = FuzzyLogicOperators.log_product_t_norm(
             L_expanded.expand(B, self.num_classes, self.num_rules, 2 * K_active),
             W_expanded.expand(B, self.num_classes, self.num_rules, 2 * K_active),
-        )  # [B, C, R]
+        )
 
-        # Step 4: 析取 (OR over rules for each class)
-        Y_hat = FuzzyLogicOperators.log_product_t_conorm(P_rules)  # [B, C]
+        Y_hat = FuzzyLogicOperators.log_product_t_conorm(P_rules)
 
+        if return_intermediates:
+            return Y_hat, {
+                "L": L,
+                "omega_active": omega_active,
+                "W": W,
+                "P_rules": P_rules,
+            }
         return Y_hat
 
     def compute_logic_loss(
@@ -147,43 +151,31 @@ class DifferentiableDNF(nn.Module):
         K_active: int,
         lambda_l1: float = 1e-3,
         lambda_conflict: float = 1e-2,
+        target_active: float = 3.0,
     ) -> dict:
-        """
-        计算逻辑正则化损失
-        
-        Returns:
-            dict: {
-                'L_L1': 稀疏惩罚,
-                'L_conflict': 互斥惩罚,
-                'L_total': 加权总和,
-            }
-        """
-        # 仅对活跃维度计算
+        """Compute logic regularization: targeted sparsity + conflict penalty."""
         omega_active = self.Omega[:, :, :2 * K_active]  # [C, R, 2K]
         sig = torch.sigmoid(omega_active)
 
-        # --- 稀疏惩罚 L_L1 ---
-        # 鼓励逻辑掩码稀疏，减少每条规则使用的文字数
-        L_L1 = sig.abs().mean()
+        # Targeted sparsity: penalise deviation from target_active literals per rule
+        active_per_rule = sig.sum(dim=-1)  # [C, R]
+        L_sparse = ((active_per_rule - target_active) ** 2).mean()
 
-        # --- 互斥惩罚 L_conflict ---
-        # 同一规则不应对同一属性同时选择肯定和否定
-        # W_plus = sig[:, :, :K]  (肯定部分)
-        # W_minus = sig[:, :, K:]  (否定部分)
+        # Conflict: same concept should not have both positive and negative active
         K = K_active
-        W_plus = sig[:, :, :K]       # [C, R, K]
-        W_minus = sig[:, :, K:2*K]   # [C, R, K]
+        W_plus = sig[:, :, :K]
+        W_minus = sig[:, :, K:2*K]
         L_conflict = (W_plus * W_minus).sum() / (self.num_classes * self.num_rules * K + 1e-8)
 
-        L_total = lambda_l1 * L_L1 + lambda_conflict * L_conflict
+        L_total = lambda_l1 * L_sparse + lambda_conflict * L_conflict
 
         return {
-            "L_L1": L_L1,
+            "L_sparse": L_sparse,
             "L_conflict": L_conflict,
             "L_total": L_total,
         }
 
-    def expand_classes(self, num_new_classes: int) -> None:
+    def expand_classes(self, num_new_classes: int, current_k_active: int = None) -> None:
         """
         增量扩展类别数
         
@@ -195,12 +187,12 @@ class DifferentiableDNF(nn.Module):
         # 冻结旧类别
         self.frozen_class_mask[:old_C] = True
 
-        # 扩展 Omega
         old_omega = self.Omega.data  # [old_C, R, 2M]
-        new_omega = torch.randn(
+        new_omega = self._sparse_init_omega(
             num_new_classes, self.num_rules, 2 * self.max_concepts,
-            device=old_omega.device, dtype=old_omega.dtype,
-        ) * self.init_scale
+            self.init_active_per_rule,
+            active_range=2 * current_k_active if current_k_active else None,
+        ).to(device=old_omega.device, dtype=old_omega.dtype)
 
         expanded = torch.cat([old_omega, new_omega], dim=0)  # [new_C, R, 2M]
         self.Omega = nn.Parameter(expanded)

@@ -72,7 +72,7 @@ ncrn_enabled = True
 ncrn_feat_dim = 256           # 输入特征维度 (= hidden_dim)
 ncrn_total_concepts = 2048    # 字典总容量 M
 ncrn_init_active = 64         # 初始激活概念数 K
-ncrn_num_rules = 8            # 每类 DNF 规则数 R
+ncrn_num_rules = 3            # 每类 DNF 规则数 R (V4: 8→3, 避免 OR 饱和)
 ncrn_lambda_l1 = 1e-3         # 稀疏正则化系数
 ncrn_lambda_conflict = 1e-2   # 互斥正则化系数
 ncrn_new_concepts = 16        # 增量学习每次新增概念数

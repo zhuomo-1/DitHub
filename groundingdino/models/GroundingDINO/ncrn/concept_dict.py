@@ -50,15 +50,18 @@ class OrthogonalConceptDict(nn.Module):
         feat_dim: int = 256,
         total_concepts: int = 2048,
         init_active: int = 64,
+        init_tau: float = 0.5,
     ):
         super().__init__()
         self.feat_dim = feat_dim           # D
         self.total_concepts = total_concepts  # M
         self.K_active = init_active        # 当前激活数
 
+        # Learnable temperature for cosine similarity → concept activation
+        self.log_tau = nn.Parameter(torch.tensor(float(init_tau)).log())
+
         # 预分配字典参数 P_total ∈ R^{M×D}，正交初始化
         P_total = torch.empty(total_concepts, feat_dim)
-        # 分块正交初始化（因为 M 可能 > D）
         num_blocks = (total_concepts + feat_dim - 1) // feat_dim
         for i in range(num_blocks):
             start = i * feat_dim
@@ -67,12 +70,9 @@ class OrthogonalConceptDict(nn.Module):
             nn.init.orthogonal_(block)
             P_total[start:end] = block
 
-        # L2 归一化每行
         P_total = F.normalize(P_total, p=2, dim=1)
         self.P_total = nn.Parameter(P_total)
 
-        # 冻结掩码: 标记哪些维度的梯度应被阻断
-        # frozen_mask[k] = True 表示第 k 行已冻结（旧概念）
         self.register_buffer(
             "frozen_mask",
             torch.zeros(total_concepts, dtype=torch.bool),
@@ -91,16 +91,14 @@ class OrthogonalConceptDict(nn.Module):
             Z: ROI 特征 [B, D]
         
         Returns:
-            C: 概念激活值 [B, K_active]，值域 [0, 1]
+            C: 概念激活值 [B, K_active]，值域 (0, 1)
         """
-        # 严格 L2 归一化
         Z_norm = F.normalize(Z, p=2, dim=-1)                  # [B, D]
         P_norm = F.normalize(self.P_active, p=2, dim=-1)      # [K_active, D]
 
-        # 点积计算相似度，值域 [-1, 1] → 映射到 [0, 1]
-        # 使用 (1+cos)/2 映射，保证概念激活值在 [0,1] 内
         cos_sim = torch.mm(Z_norm, P_norm.t())                # [B, K_active]
-        C = (cos_sim + 1.0) / 2.0                             # [B, K_active]
+        tau = self.log_tau.exp().clamp(min=0.01)
+        C = torch.sigmoid(cos_sim / tau)                      # [B, K_active]
         return C
 
     @torch.no_grad()

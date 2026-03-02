@@ -10,7 +10,7 @@ eval "$(conda shell.bash hook)"
 conda activate dithub
 
 # 默认参数
-OUTPUT_DIR="${OUTPUT_DIR:-/output/ncrn_output}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/ncrn_output}"
 SEED="${SEED:-3}"
 NUM_GPUS="${NUM_GPUS:-1}"
 CHECKPOINT="${CHECKPOINT:-groundingdino_swint_ogc.pth}"

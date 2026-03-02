@@ -97,6 +97,153 @@ HF_HUB_OFFLINE=1 /opt/data/private/conda_envs/dithub/bin/python -u main.py \
 
 ## 变更日志
 
+### [2026-03-02 22:00] NSPS v2 架构诊断与重设计 — NCRN 应作为 class_embed 替换 🔄
+
+- **Status**: 诊断完成，架构重设计方案确定，准备实施
+- **问题诊断**:
+  - **Upper Bound 对比**: LoRA 微调方案 Mean AP = 58.54（13 task），当前 NSPS 3-task Mean AP = 21.73，差距明显
+  - **根因分析 1 — GD objectness 极低**: 无 LoRA 的原始 GD 的 `class_embed`（`hs @ text.T`）在下游任务上 objectness 几乎全 < 0.1（mean ≈ 0.01），因为 text-vision alignment 未被适配
+  - **根因分析 2 — NCRN 无 per-query 区分力**: NCRN 用 `hs.mean(dim=1)` (image-level) 训练，但推理时逐 query 送入，导致所有 900 个 query 都得到 ~0.96 的高分（train-test mismatch）
+  - **根因分析 3 — 架构设计缺陷**: 当前 NSPS 完全绕开了 GD 的视觉-语言能力，`hs.mean(dim=1)` 把 VLM 降级成纯视觉特征提取器
+  - **Objectness 信号探索**: 对比 5 种替代 objectness 信号（q_norm, bbox_area, ref_shift, box_consistency, gd_objectness），发现 **bbox area 分离度 > 96%** 是最强信号
+- **架构重设计方案 — NCRN 作为 class_embed 的 Drop-in 替换**:
+  - GD 原始分类通路: `hs [B,900,D] × text.T → per-query per-class logits`
+  - NCRN 新定位: `hs [B,900,D] → ConceptDict → DNF → per-query per-class logits`
+  - 核心改动:
+    1. **特征采集改为 per-query**: 用 GT bbox IoU 匹配为每个 query 生成标签（正样本=对应GT类，背景=全零）
+    2. **Router 不变**: 仍用 image-level 均值特征做任务路由
+    3. **推理移除 GD objectness**: NCRN 在 per-query 级别训练后自然能区分 object vs background
+  - 创新叙事: NCRN 用轻量级神经符号规则替代了 LoRA 的 text-vision alignment 适配，参数高效、零遗忘、可解释
+- **新增文件**:
+  - `scripts/analyze_signals.py` — objectness 信号分离度分析脚本
+- **修改文件**:
+  - `groundingdino/config/GroundingDINO_SwinT_OGC_dt_ncrn.py` — ncrn_num_rules 8→3
+  - `groundingdino/models/GroundingDINO/ncrn/concept_dict.py` — cosine→Linear+sigmoid
+  - `groundingdino/models/GroundingDINO/ncrn/dnf_engine.py` — 稀疏初始化+退火sigmoid+目标条件数正则
+  - `groundingdino/models/GroundingDINO/ncrn/ncrn_head.py` — num_rules 默认 3
+  - `groundingdino/models/GroundingDINO/ncrn/nsps_system.py` — Omega 独立 LR、梯度裁剪、退火控制
+  - `main_nsps.py` — objectness 加权推理、epochs/lr 调整
+  - `run_nsps_3task.py` — 3-task 快速验证脚本
+  - `tests/test_nsps.py` — 适配新 router 设计的单元测试
+
+### [2026-03-02 10:30] NSPS v2 服务器端完整实验 🔄
+
+- **Status**: In Progress（13/13 训练完成，评估已完成，AP 偏低待优化）
+- **Changes (变更详情)**:
+  - 📂 `File/Folder`: 建立数据集/模型/CUDA算子软链接
+    - `datasets/odinw13` → `/opt/data/private/why/DitHub-ori/datasets/odinw13`
+    - `datasets/coco` → `/opt/data/private/why/DitHub-ori/datasets/coco`
+    - `groundingdino_swint_ogc.pth` → `/opt/data/private/why/DitHub-ori/groundingdino_swint_ogc.pth`
+    - `MultiScaleDeformableAttention.cpython-39-x86_64-linux-gnu.so` → DitHub 已编译算子
+  - 📂 `File/Folder`: 新增 `ncrn/polarized_router.py` — System 1 极化前件路由器
+    - `PolarizedAntecedentBase` 类：零空间正交投影 + SVD 零空间软排斥
+    - `register_task` / `route` / `_polarize` / `_soft_repulse` / `get_active_probes`
+    - SVD 零空间保护：当能量损失 >90% 时在正交补空间中随机采样方向
+  - 📂 `File/Folder`: 新增 `ncrn/hard_negative_sampler.py` — 硬负样本采样器
+    - 按路由相似度从最相似其他任务采样负例
+    - 无路由信息时退化为均匀采样
+  - 📂 `File/Folder`: 新增 `tests/test_nsps.py` — 8 个 NSPS 单元测试
+  - 📂 `File/Folder`: 更新 `ncrn/__init__.py` — 导出 `PolarizedAntecedentBase`、`HardNegativeSampler`、`NSPSSystem`
+  - 🐛 `Bug Fix`: 修复 `main_nsps.py` 三个关键 Bug
+    - **Bug 1**: `TaskMemory().task_mapping` 在 `load_grounding_dino()` 之前未设置 → `apply_lora` 报 NoneType 错误
+    - **Bug 2**: `extract_task_features` 未调用 `TaskMemory().set_classes()` → LoRA forward 报错跳过所有 batch
+    - **Bug 3**: `save_checkpoint` 中 `task_meta` 含 LazyConfig 代理对象 → pickle 失败
+  - 🐛 `Bug Fix`: 修复 `NSPSInferenceModel` 类别映射 Bug
+    - 原实现使用全局累加偏移 ID → COCOEvaluator 断言失败（class > num_classes）
+    - 新增 `set_eval_task(task_idx)` 方法，评估时只输出目标任务的局部类别 ID
+- **实验结果 — 13 任务训练**:
+
+    | Task | 数据集 | 类别数 | Loss | gamma | 参数量 |
+    |------|--------|--------|------|-------|--------|
+    | 0 | AerialMaritimeDrone | 5 | 2.0028 | 0.9000 | 21504 |
+    | 1 | CottontailRabbits | 1 | 2.6600 | 0.9000 | 17408 |
+    | 2 | Egohands | 1 | 2.7759 | 0.9000 | 17408 |
+    | 3 | NorthAmericaMushrooms | 2 | 5.5347 | 0.9000 | 18432 |
+    | 4 | Packages | 1 | 2.6183 | 0.9000 | 17408 |
+    | 5 | PascalVOC | 20 | 0.1792 | 0.3866 | 36864 |
+    | 6 | Raccoon | 1 | 2.7014 | 0.9000 | 17408 |
+    | 7 | ShellfishOpenImages | 3 | 7.8317 | 0.9000 | 19456 |
+    | 8 | VehiclesOpenImages | 5 | 3.0523 | 0.9000 | 21504 |
+    | 9 | Aquarium | 7 | 1.5845 | 0.9000 | 23552 |
+    | 10 | pistols | 1 | 2.6600 | 0.9000 | 17408 |
+    | 11 | pothole | 1 | 2.5769 | 0.9000 | 17408 |
+    | 12 | thermalDogsAndPeople | 2 | 0.5577 | 0.4778 | 18432 |
+
+    **全局**: 13 任务, 50 类别, 总训练时间 ~8 分钟 (GPU 4090)
+
+- **实验结果 — COCO AP@50:95 评估**:
+
+    | 数据集 | AP | 备注 |
+    |--------|------|------|
+    | AerialMaritimeDrone | 0.3% | 航拍小目标 |
+    | CottontailRabbits | 6.7% | |
+    | Egohands | 5.5% | |
+    | NorthAmericaMushrooms | 2.1% | |
+    | Packages | 8.2% | 最高 |
+    | PascalVOC | 0.8% | 20类复杂 |
+    | Raccoon | 4.9% | |
+    | ShellfishOpenImages | 3.2% | |
+    | VehiclesOpenImages | 0.8% | |
+    | Aquarium | 2.1% | |
+    | pistols | 1.1% | |
+    | pothole | 0.9% | |
+    | thermalDogsAndPeople | 0.6% | |
+    | **Mean AP** | **~2.8%** | **baseline v1 实验** |
+
+- **Pitfalls & Solutions (踩坑与修复)**:
+    1. **TaskMemory.task_mapping 为 None**: `apply_lora` 在模型加载时就需要 `task_mapping`，但原代码在训练循环内才设置 → 提前到 `load_grounding_dino` 之前
+    2. **LoRA forward 需要 set_classes**: `groundingdino_dt.forward` 会自动设置，但 `extract_task_features` 手动调用模型内部组件绕过了它 → 新增 `_set_memory_classes_for_batch` 辅助函数
+    3. **pickle Lambda 失败**: LazyConfig 对象中含 lambda → `save_checkpoint` 中显式深拷贝为纯 Python 类型
+    4. **全局 vs 局部类别 ID**: COCOEvaluator 期望局部 ID → `set_eval_task()` 在评估循环中切换
+
+- **Dev Notes (开发备忘)**:
+  - **GPU 使用**: 所有训练和评估使用 `CUDA_VISIBLE_DEVICES=4,5` (GPU 4090 x 2)
+  - **单元测试**: 8/8 通过（极化正交 max_sim=0.000000, 特征坍塌保护 sim_after=0.000000）
+  - **AP 偏低分析**: 当前 NSPS 使用 query 均值池化作为特征，丢失了空间信息；且 NCRN 在 50 epoch 内对多数任务 loss 未充分收敛（gamma 被 clamp 到 0.9）
+  - **下一步优化方向**: → 见 [2026-03-02 14:06] 条目（已实施修复）
+  - **Checkpoint**: `output/nsps_output/nsps_checkpoint/` (13 tasks, router.pth + ncrn_0-12.pth)
+
+---
+
+### [2026-03-02 14:06] NSPS v2 系统性修复 — Mean AP 从 0.92% → 21.73% (3-task) 🔧
+
+- **Status**: Completed (3-task 快速验证通过)
+- **根因诊断** (发现 5 大系统性缺陷):
+  1. **路由完全失效 (0% → 97%)**: 零空间极化把探针推离真实数据流形（特征间 cos_sim 0.93~0.99），所有样本路由到 Task 0 → 改为保留原始均值探针 + 降低 tau=0.01
+  2. **NCRN 分类坍塌**: `(1+cos)/2` 映射使概念激活值集中在 0.5±0.03，无区分力 → 改为可学习 `Linear(D, K) + sigmoid`
+  3. **DNF OR 饱和陷阱**: 初始 Y_hat ≈ 0.996（8 条规则 OR 后 1-(0.5)^8），sigmoid(Omega) 永远卡在 [0.4-0.6] → 稀疏确定性初始化（每规则只绑定 3 个文字）+ 退火 sigmoid 替代 STE 硬阈值 + R=8→3
+  4. **Omega 梯度饥饿**: 每步更新量 ≈ 1.6e-6，需要 31250 步才能移动 0.05 → Omega 独立 10x 学习率 + grad_clip 从 0.1→5.0
+  5. **训练/推理特征不对齐**: 训练用 image-level 均值，推理用 per-query → 统一为 image-level 路由 + GD objectness × NCRN 分类概率
+
+- **修改文件**:
+  - `ncrn/polarized_router.py` — 移除极化逻辑，保留原始均值探针，tau 默认从 0.07→0.01
+  - `ncrn/concept_dict.py` — 从 cosine+映射 改为 `Linear + sigmoid` 可学习投影
+  - `ncrn/dnf_engine.py` — 稀疏确定性初始化 + 退火 sigmoid(β·Ω) + 目标条件数正则 + R 默认 8→3
+  - `ncrn/nsps_system.py` — Omega 独立 10x 学习率 + DNF 退火步进 + tau/gamma/grad_clip 调整
+  - `main_nsps.py` — image-level 路由 + GD objectness 加权 + text_dict 传递
+  - `ncrn/ncrn_head.py` — num_rules 默认 8→3
+  - `GroundingDINO_SwinT_OGC_dt_ncrn.py` — ncrn_num_rules 从 8→3
+  - `tests/test_nsps.py` — 适配新路由器（不再要求正交）
+  - 新增 `run_nsps_3task.py` — 3-task 快速验证脚本
+
+- **3-Task 验证结果 (AerialMaritime + CottontailRabbits + Egohands)**:
+
+    | 任务 | 类别数 | v1 AP | v2 AP | v2 AP50 | 训练 loss | gamma |
+    |------|--------|-------|-------|---------|-----------|-------|
+    | AerialMaritimeDrone | 5 | 0.3% | **4.1%** | 10.8% | 0.324 | 0.54 |
+    | CottontailRabbits | 1 | 0.0% | **4.1%** | 7.5% | 0.011 | 0.90 |
+    | Egohands | 1 | 2.3% | **57.0%** | **88.7%** | 0.020 | 0.90 |
+    | **Mean AP** | | **0.9%** | **21.7%** | | | |
+
+    训练诊断：路由 top-1 准确率 87%~97%，NCRN 预测多类别，概率分布有真实区分力
+
+- **Dev Notes**:
+  - 3-task 端到端用时 ~3.5 分钟（含训练+评估）
+  - Checkpoint: `output/nsps_3task/nsps_checkpoint/`
+  - 下一步：跑全量 13-task 实验
+
+---
+
 ### [2026-03-02 15:20] NSPS Bug 修复 + main_nsps.py 创建 ✅
 
 - **Status**: Completed

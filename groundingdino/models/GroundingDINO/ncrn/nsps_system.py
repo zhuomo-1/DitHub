@@ -62,12 +62,12 @@ class NSPSSystem(nn.Module):
         self,
         feat_dim: int = 256,
         concepts_per_task: int = 64,
-        rules_per_class: int = 8,
+        rules_per_class: int = 3,
         lambda_l1: float = 1e-3,
         lambda_conflict: float = 1e-2,
         top_k: int = 3,
         gamma: float = 0.3,
-        tau: float = 0.07,
+        tau: float = 0.01,
         neg_ratio: float = 0.2,
         l1_anneal_epochs: int = 5,
     ):
@@ -155,21 +155,29 @@ class NSPSSystem(nn.Module):
         ncrn = ncrn.to(device)
         ncrn.train()
 
-        optimizer = torch.optim.AdamW(
-            ncrn.parameters(), lr=lr, weight_decay=weight_decay,
-        )
+        # Omega 独立学习率（10x），加速逻辑规则结构学习
+        omega_params = [ncrn.dnf.Omega]
+        other_params = [p for n, p in ncrn.named_parameters() if 'dnf.Omega' not in n]
+
+        optimizer = torch.optim.AdamW([
+            {"params": other_params, "lr": lr, "weight_decay": weight_decay},
+            {"params": omega_params, "lr": lr * 10.0, "weight_decay": 0.0},
+        ])
+
+        # 设置退火总步数
+        total_steps = num_epochs * max(1, Z_train.shape[0] // batch_size)
+        ncrn.dnf._anneal_steps = max(total_steps // 2, 100)
+        ncrn.dnf._train_step = 0
 
         N = Z_train.shape[0]
         stats = {"losses": [], "final_loss": float("inf")}
 
         for epoch in range(num_epochs):
-            # L1 退火: 前 l1_anneal_epochs 内从 0 线性增长到 lambda_l1
             if epoch < self.l1_anneal_epochs:
                 current_l1 = self.lambda_l1 * (epoch / max(1, self.l1_anneal_epochs))
             else:
                 current_l1 = self.lambda_l1
 
-            # 硬负样本增强
             Z_aug, Y_aug = self.neg_sampler.sample(
                 Z_train, Y_train,
                 stored_features=self._feature_cache,
@@ -177,7 +185,6 @@ class NSPSSystem(nn.Module):
                 router_K=self.router.get_active_probes() if self.num_tasks > 0 else None,
             )
 
-            # Mini-batch 训练
             perm = torch.randperm(Z_aug.shape[0], device=device)
             epoch_loss = 0.0
             n_batches = 0
@@ -187,17 +194,14 @@ class NSPSSystem(nn.Module):
                 Z_batch = Z_aug[idx]
                 Y_batch = Y_aug[idx]
 
-                # 前向
-                Y_hat = ncrn(Z_batch)  # [B, C]
+                Y_hat = ncrn(Z_batch)
 
-                # BCE 分类损失
                 L_BCE = F.binary_cross_entropy(
                     Y_hat.clamp(1e-7, 1.0 - 1e-7),
                     Y_batch.float(),
                     reduction="mean",
                 )
 
-                # 逻辑正则化（带退火）
                 logic_loss = ncrn.dnf.compute_logic_loss(
                     K_active=ncrn.K_active,
                     lambda_l1=current_l1,
@@ -208,8 +212,10 @@ class NSPSSystem(nn.Module):
 
                 optimizer.zero_grad()
                 L_total.backward()
-                torch.nn.utils.clip_grad_norm_(ncrn.parameters(), max_norm=0.1)
+                torch.nn.utils.clip_grad_norm_(ncrn.parameters(), max_norm=5.0)
                 optimizer.step()
+
+                ncrn.dnf.step_anneal()
 
                 epoch_loss += L_total.item()
                 n_batches += 1
@@ -218,9 +224,10 @@ class NSPSSystem(nn.Module):
             stats["losses"].append(avg_loss)
 
             if verbose and (epoch % 10 == 0 or epoch == num_epochs - 1):
+                beta = ncrn.dnf._get_beta()
                 logger.info(
                     f"  [Task {task_id}] Epoch {epoch}/{num_epochs}: "
-                    f"loss={avg_loss:.4f} (l1_coeff={current_l1:.5f})"
+                    f"loss={avg_loss:.4f} (l1={current_l1:.5f}, beta={beta:.1f})"
                 )
 
         stats["final_loss"] = stats["losses"][-1] if stats["losses"] else float("inf")
@@ -298,8 +305,7 @@ class NSPSSystem(nn.Module):
             sorted_probs = max_probs_val.sort().values
             p5_idx = max(0, int(len(sorted_probs) * 0.05))
             task_gamma = sorted_probs[p5_idx].item()
-            # 限制在 [0.1, 0.9] 范围内
-            task_gamma = max(0.1, min(0.9, task_gamma))
+            task_gamma = max(0.05, min(0.9, task_gamma))
 
         # 缓存特征
         self._feature_cache[task_id] = Z_samples.detach().clone()
@@ -535,18 +541,27 @@ class NSPSSystem(nn.Module):
         for i, ncrn in enumerate(self.consequents):
             torch.save(ncrn.state_dict(), os.path.join(save_dir, f"ncrn_{i}.pth"))
 
-        # 3. 保存元信息
+        # 3. 保存元信息（显式深拷贝为纯 Python 类型，避免 LazyConfig 代理对象导致 pickle 失败）
+        clean_meta = []
+        for m in self.task_meta:
+            clean_meta.append({
+                "task_id": int(m["task_id"]),
+                "num_classes": int(m["num_classes"]),
+                "class_names": list(m.get("class_names", [])),
+                "num_samples": int(m.get("num_samples", 0)),
+                "task_gamma": float(m.get("task_gamma", self.gamma)),
+            })
         torch.save({
-            "task_meta": self.task_meta,
+            "task_meta": clean_meta,
             "num_tasks": self.num_tasks,
             "config": {
-                "feat_dim": self.feat_dim,
-                "concepts_per_task": self.concepts_per_task,
-                "rules_per_class": self.rules_per_class,
-                "lambda_l1": self.lambda_l1,
-                "lambda_conflict": self.lambda_conflict,
-                "top_k": self.top_k,
-                "gamma": self.gamma,
+                "feat_dim": int(self.feat_dim),
+                "concepts_per_task": int(self.concepts_per_task),
+                "rules_per_class": int(self.rules_per_class),
+                "lambda_l1": float(self.lambda_l1),
+                "lambda_conflict": float(self.lambda_conflict),
+                "top_k": int(self.top_k),
+                "gamma": float(self.gamma),
             },
         }, os.path.join(save_dir, "nsps_meta.pth"))
 

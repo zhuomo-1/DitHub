@@ -48,7 +48,7 @@ class NCRN_Head(nn.Module):
         num_classes: int = 10,
         total_concepts: int = 2048,
         init_active: int = 64,
-        num_rules: int = 8,
+        num_rules: int = 3,
         lambda_l1: float = 1e-3,
         lambda_conflict: float = 1e-2,
     ):

@@ -1,19 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-可微 DNF 规则引擎 (Differentiable DNF Engine)
-=============================================
-将纯张量运算转化为标准 PyTorch nn.Module 的堆叠，
-无缝融合神经与符号推理。
+可微 DNF 规则引擎 (Differentiable DNF Engine) v2
+=================================================
+核心改进（解决 Y_hat 初始化 ≈ 1.0 的 OR 饱和陷阱）:
 
-核心机制:
-1. 双极性映射: L = cat([C, 1-C])，前半代表属性存在，后半代表不存在
-2. Binary STE:  W = (σ(Ω)>0.5).float() - σ(Ω).detach() + σ(Ω)
-                前向是稀疏布尔掩码，反向是连续 Sigmoid 梯度
-3. 逻辑聚合:   用 FuzzyLogicOperators 的对数空间算子完成合取与析取
-
-参考:
-- pytorch_explain ConceptReasoningLayer 的 sign_attn + filter_attn 设计
-- LTNtorch 的 stable 模式数值护栏
+1. 稀疏确定性初始化: 每条规则只强绑定 2~3 个文字（Ω=+3），其余全关（Ω=-3），
+   使初始 P_rule ≈ C1*C2 ≈ 0.25 而非之前的 ≈ 0.5。
+2. 退火 sigmoid: 训练早期用软 sigmoid(β·Ω) 代替 STE 硬阈值 0.5，
+   打通梯度高速公路；后期 β→∞ 逼近离散逻辑。
+3. 目标条件数正则: 不再无差别 L1 打压所有 Ω，而是将每条规则的激活文字数
+   拉向目标值 μ_target ≈ 3，防止全开/全关坍塌。
 """
 
 import torch
@@ -22,82 +18,81 @@ import torch.nn as nn
 from .fuzzy_ops import FuzzyLogicOperators
 
 
-class BinarySTE(torch.autograd.Function):
-    """
-    Binary Straight-Through Estimator
-    
-    前向: 离散化为 0/1 (threshold=0.5)
-    反向: 梯度直通 (identity)
-    """
-
-    @staticmethod
-    def forward(ctx, input: torch.Tensor) -> torch.Tensor:
-        return (input > 0.5).float()
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
-        return grad_output  # straight-through
-
-
 class DifferentiableDNF(nn.Module):
     """
-    可微析取范式 (DNF) 规则引擎
-    
-    每个类别有 R 条规则，每条规则对 2*K_active 个文字（含正/负）
-    进行加权合取，然后 R 条规则进行析取组合。
-    
+    可微析取范式 (DNF) 规则引擎 v2
+
     参数:
-        max_concepts (int): 字典总容量 M (与 OrthogonalConceptDict 对齐)
+        max_concepts (int): 字典总容量 M
         num_classes (int): 初始类别数 C
-        num_rules (int): 每类规则数 R (默认 8)
-        init_scale (float): Omega 初始化标准差
+        num_rules (int): 每类规则数 R (默认 3)
+        literals_per_rule (int): 每条规则初始绑定的文字数 (默认 3)
     """
 
     def __init__(
         self,
         max_concepts: int = 2048,
         num_classes: int = 10,
-        num_rules: int = 8,
-        init_scale: float = 0.01,
+        num_rules: int = 3,
+        literals_per_rule: int = 3,
     ):
         super().__init__()
-        self.max_concepts = max_concepts  # M
-        self.num_classes = num_classes    # C_total
-        self.num_rules = num_rules       # R
-        self.init_scale = init_scale
+        self.max_concepts = max_concepts
+        self.num_classes = num_classes
+        self.num_rules = num_rules
+        self.literals_per_rule = literals_per_rule
 
-        # 逻辑权重掩码 Ω ∈ R^{C_total × R × 2M}
-        # 使用 2M 是因为双极性扩展 (正/负文字)
-        self.Omega = nn.Parameter(
-            torch.randn(num_classes, num_rules, 2 * max_concepts) * init_scale
-        )
+        omega = self._sparse_init(num_classes, num_rules, 2 * max_concepts, literals_per_rule)
+        self.Omega = nn.Parameter(omega)
 
-        # 冻结掩码: 标记哪些类别的 Omega 行已冻结 (旧类别)
         self.register_buffer(
             "frozen_class_mask",
             torch.zeros(num_classes, dtype=torch.bool),
         )
 
-    def _bipolar_expand(self, C: torch.Tensor) -> torch.Tensor:
-        """
-        双极性映射
-        C [B, K] → L [B, 2K]
-        前 K 维: 属性存在 (C)
-        后 K 维: 属性不存在 (1-C)
-        """
-        return torch.cat([C, 1.0 - C], dim=-1)  # [B, 2K]
+        self._train_step = 0
+        self._anneal_steps = 500
 
-    def _binary_ste(self, omega: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _sparse_init(C, R, num_literals, lits_per_rule):
         """
-        Binary STE 离散化
-        
-        前向: W = (σ(Ω) > 0.5).float()  — 稀疏布尔掩码
-        反向: 连续的 Sigmoid 梯度
-        
-        实现: W = STE(σ(Ω)) = (σ(Ω)>0.5).float() - σ(Ω).detach() + σ(Ω)
+        稀疏确定性初始化:
+        - 基础值 -3.0 → sigmoid(-3) ≈ 0.047，STE/soft 判定为 off
+        - 每条规则随机选 lits_per_rule 个文字设为 +3.0 → sigmoid(3) ≈ 0.953，判定为 on
         """
-        sig = torch.sigmoid(omega)
-        return BinarySTE.apply(sig) - sig.detach() + sig
+        omega = torch.full((C, R, num_literals), -3.0)
+        for c in range(C):
+            for r in range(R):
+                active_idx = torch.randperm(num_literals)[:lits_per_rule]
+                omega[c, r, active_idx] = 3.0
+        return omega
+
+    def _get_beta(self) -> float:
+        """退火温度: 1.0 → 10.0 线性退火"""
+        progress = min(1.0, self._train_step / max(1, self._anneal_steps))
+        return 1.0 + 9.0 * progress
+
+    def _get_weights(self, omega: torch.Tensor) -> torch.Tensor:
+        """
+        退火 sigmoid 替代 STE:
+        - 训练早期 (β≈1): soft sigmoid，梯度畅通
+        - 训练后期 (β≈10): 逼近硬阈值，保持逻辑稀疏性
+        - eval 模式: 直接硬阈值
+        """
+        if not self.training:
+            return (torch.sigmoid(omega) > 0.5).float()
+
+        beta = self._get_beta()
+        soft_w = torch.sigmoid(omega * beta)
+
+        if beta >= 8.0:
+            hard_w = (soft_w > 0.5).float()
+            return hard_w - soft_w.detach() + soft_w
+        return soft_w
+
+    def _bipolar_expand(self, C: torch.Tensor) -> torch.Tensor:
+        """C [B, K] → L [B, 2K]: 前 K = 存在, 后 K = 不存在"""
+        return torch.cat([C, 1.0 - C], dim=-1)
 
     def forward(
         self,
@@ -105,42 +100,35 @@ class DifferentiableDNF(nn.Module):
         K_active: int,
     ) -> torch.Tensor:
         """
-        DNF 前向推理
-        
         Args:
-            C: 概念激活值 [B, K_active]，来自 OrthogonalConceptDict
+            C: 概念激活值 [B, K_active]
             K_active: 当前激活概念数
-        
+
         Returns:
             Y_hat: 类别概率 [B, C_total]
         """
         B = C.shape[0]
-        
-        # Step 1: 双极性扩展
+
         L = self._bipolar_expand(C)  # [B, 2*K_active]
 
-        # Step 2: 截取活跃维度的 Omega 并 STE 离散化
-        # Omega[:, :, :2*K_active] → 仅使用与当前激活概念对应的部分
         omega_active = self.Omega[:, :, :2 * K_active]  # [C, R, 2K]
-        W = self._binary_ste(omega_active)               # [C, R, 2K]
+        W = self._get_weights(omega_active)               # [C, R, 2K]
 
-        # Step 3: 合取 (AND over literals within each rule)
-        # 对每条规则：LogSpaceAnd(L, W)
-        # L: [B, 2K] → 扩展为 [B, 1, 1, 2K] 以便广播
-        # W: [C, R, 2K]
         L_expanded = L.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, 2K]
         W_expanded = W.unsqueeze(0)                # [1, C, R, 2K]
 
-        # 对数空间合取
         P_rules = FuzzyLogicOperators.log_product_t_norm(
             L_expanded.expand(B, self.num_classes, self.num_rules, 2 * K_active),
             W_expanded.expand(B, self.num_classes, self.num_rules, 2 * K_active),
         )  # [B, C, R]
 
-        # Step 4: 析取 (OR over rules for each class)
         Y_hat = FuzzyLogicOperators.log_product_t_conorm(P_rules)  # [B, C]
 
         return Y_hat
+
+    def step_anneal(self):
+        """每个 training step 后调用，推进退火进度"""
+        self._train_step += 1
 
     def compute_logic_loss(
         self,
@@ -149,78 +137,63 @@ class DifferentiableDNF(nn.Module):
         lambda_conflict: float = 1e-2,
     ) -> dict:
         """
-        计算逻辑正则化损失
-        
-        Returns:
-            dict: {
-                'L_L1': 稀疏惩罚,
-                'L_conflict': 互斥惩罚,
-                'L_total': 加权总和,
-            }
+        目标条件数正则 + 互斥惩罚
+
+        - 稀疏项: 将每条规则的激活文字数拉向 literals_per_rule (≈3)
+        - 互斥项: 同一属性不应同时被选中和否定
         """
-        # 仅对活跃维度计算
-        omega_active = self.Omega[:, :, :2 * K_active]  # [C, R, 2K]
+        omega_active = self.Omega[:, :, :2 * K_active]
         sig = torch.sigmoid(omega_active)
 
-        # --- 稀疏惩罚 L_L1 ---
-        # 鼓励逻辑掩码稀疏，减少每条规则使用的文字数
-        L_L1 = sig.abs().mean()
+        # 目标条件数正则: (sum_of_activations - target)^2
+        rule_activation_count = sig.sum(dim=-1)  # [C, R]
+        mu_target = float(self.literals_per_rule)
+        L_sparse = ((rule_activation_count - mu_target) ** 2).mean()
 
-        # --- 互斥惩罚 L_conflict ---
-        # 同一规则不应对同一属性同时选择肯定和否定
-        # W_plus = sig[:, :, :K]  (肯定部分)
-        # W_minus = sig[:, :, K:]  (否定部分)
+        # 互斥惩罚
         K = K_active
-        W_plus = sig[:, :, :K]       # [C, R, K]
-        W_minus = sig[:, :, K:2*K]   # [C, R, K]
+        W_plus = sig[:, :, :K]
+        W_minus = sig[:, :, K:2*K]
         L_conflict = (W_plus * W_minus).sum() / (self.num_classes * self.num_rules * K + 1e-8)
 
-        L_total = lambda_l1 * L_L1 + lambda_conflict * L_conflict
+        L_total = lambda_l1 * L_sparse + lambda_conflict * L_conflict
 
         return {
-            "L_L1": L_L1,
+            "L_L1": L_sparse,
             "L_conflict": L_conflict,
             "L_total": L_total,
         }
 
     def expand_classes(self, num_new_classes: int) -> None:
-        """
-        增量扩展类别数
-        
-        冻结旧类别的 Omega，扩展新类别的行
-        """
         old_C = self.num_classes
         new_C = old_C + num_new_classes
 
-        # 冻结旧类别
         self.frozen_class_mask[:old_C] = True
 
-        # 扩展 Omega
-        old_omega = self.Omega.data  # [old_C, R, 2M]
-        new_omega = torch.randn(
-            num_new_classes, self.num_rules, 2 * self.max_concepts,
-            device=old_omega.device, dtype=old_omega.dtype,
-        ) * self.init_scale
+        old_omega = self.Omega.data
+        new_omega = self._sparse_init(
+            num_new_classes, self.num_rules,
+            2 * self.max_concepts, self.literals_per_rule,
+        ).to(old_omega.device, old_omega.dtype)
 
-        expanded = torch.cat([old_omega, new_omega], dim=0)  # [new_C, R, 2M]
+        expanded = torch.cat([old_omega, new_omega], dim=0)
         self.Omega = nn.Parameter(expanded)
 
-        # 扩展冻结掩码
         new_mask = torch.zeros(new_C, dtype=torch.bool, device=self.frozen_class_mask.device)
-        new_mask[:old_C] = True  # 旧类别冻结
+        new_mask[:old_C] = True
         self.frozen_class_mask = new_mask
 
         self.num_classes = new_C
 
     def apply_gradient_mask(self):
-        """将冻结类别的梯度清零"""
         if self.Omega.grad is not None and self.frozen_class_mask.any():
-            frozen = self.frozen_class_mask  # [C]
+            frozen = self.frozen_class_mask
             self.Omega.grad.data[frozen] = 0.0
 
     def extra_repr(self) -> str:
         return (
             f"num_classes={self.num_classes}, "
             f"num_rules={self.num_rules}, "
-            f"max_concepts={self.max_concepts}"
+            f"max_concepts={self.max_concepts}, "
+            f"beta={self._get_beta():.1f}"
         )

@@ -122,6 +122,34 @@ def load_grounding_dino(model_config_path: str, model_checkpoint_path: str,
 # 特征提取（从 GroundingDINO decoder 最后一层提取 hs 均值）
 # ============================================================
 
+def _set_memory_classes_for_batch(batch, names_list):
+    """
+    设置 TaskMemory._current_classes，与 groundingdino_dt.forward 同逻辑。
+    LoRA 层的 forward 依赖此设置，否则抛出 AssertionError。
+    """
+    tm = TaskMemory()
+    memory_classes = []
+    for batch_elem, names_elem in zip(batch, names_list):
+        if 'instances' not in batch_elem or len(batch_elem['instances']) == 0:
+            memory_classes = [f'class_{n[0].lower() + n[1:]}' for n in names_elem]
+            break
+        elem_classes = batch_elem['instances'].gt_classes.tolist()
+        if not elem_classes:
+            elem_classes = [0]
+        try:
+            curr_dataset = Path(batch_elem['file_name']).parts[2].lower()
+            curr_class_int = random.choice(elem_classes)
+            curr_class_str = tm.task_mapping[curr_dataset][curr_class_int]
+            curr_class_str = curr_class_str[0].lower() + curr_class_str[1:]
+            memory_classes.append(f'class_{curr_class_str}')
+        except (KeyError, IndexError):
+            memory_classes = [f'class_{n[0].lower() + n[1:]}' for n in names_elem]
+            break
+    if not memory_classes:
+        memory_classes = [f'class_{n[0].lower() + n[1:]}' for n in names_list[0]]
+    tm.set_classes(memory_classes)
+
+
 @torch.no_grad()
 def extract_task_features(gd_model, task_loader, device: torch.device,
                           max_samples: int = 500):
@@ -144,6 +172,10 @@ def extract_task_features(gd_model, task_loader, device: torch.device,
             samples = nested_tensor_from_tensor_list(images)
             captions = [x["captions"] for x in batch]
             names_list = [x["captions"][:-1].split(".") for x in batch]
+
+            # LoRA 模块的 forward 依赖 TaskMemory.get_classes()，
+            # 这里使用与 groundingdino_dt.forward 相同的逻辑设置 memory_classes
+            _set_memory_classes_for_batch(batch, names_list)
 
             tokenized = gd_model.tokenizer(
                 captions, padding="longest", return_tensors="pt"
@@ -263,26 +295,37 @@ class NSPSInferenceModel(torch.nn.Module):
         super().__init__()
         self._gd = gd_model
         self.nsps = nsps_system
-        self.global_class_names = global_class_names  # 全局类别列表（用于评估对齐）
+        self.global_class_names = global_class_names
+        self._eval_task_idx: Optional[int] = None
+        self._eval_num_classes: Optional[int] = None
+
+    def set_eval_task(self, task_idx: int):
+        """设置当前评估的任务索引，推理只输出该任务的局部类别 ID"""
+        self._eval_task_idx = task_idx
+        if task_idx is not None and task_idx < len(self.nsps.task_meta):
+            self._eval_num_classes = self.nsps.task_meta[task_idx]["num_classes"]
+        else:
+            self._eval_num_classes = None
 
     @property
     def device(self):
         return next(self._gd.parameters()).device
 
-    @torch.no_grad()
-    def forward(self, batched_inputs):
+    def _extract_hs_and_ref(self, batched_inputs):
+        """提取 decoder 输出 hs 和 reference，复用于 forward"""
         images = self._gd.preprocess_image(batched_inputs)
         samples = nested_tensor_from_tensor_list(images)
         image_sizes = images.image_sizes
-
         captions = [x["captions"] for x in batched_inputs]
         names_list = [x["captions"][:-1].split(".") for x in batched_inputs]
         device = self.device
 
+        _set_memory_classes_for_batch(batched_inputs, names_list)
+
         tokenized = self._gd.tokenizer(
             captions, padding="longest", return_tensors="pt"
         ).to(device)
-        (text_self_attention_masks, position_ids, cate_to_token_mask_list) = (
+        (text_self_attention_masks, position_ids, _) = (
             generate_masks_with_special_tokens_and_transfer_map(
                 tokenized, self._gd.specical_tokens, self._gd.tokenizer
             )
@@ -315,10 +358,8 @@ class NSPSInferenceModel(torch.nn.Module):
             text_self_attention_masks = text_self_attention_masks[:, :L, :L]
 
         text_dict = {
-            "encoded_text": encoded_text,
-            "text_token_mask": text_token_mask,
-            "position_ids": position_ids,
-            "text_self_attention_masks": text_self_attention_masks,
+            "encoded_text": encoded_text, "text_token_mask": text_token_mask,
+            "position_ids": position_ids, "text_self_attention_masks": text_self_attention_masks,
         }
 
         features, poss = self._gd.backbone(samples)
@@ -339,67 +380,71 @@ class NSPSInferenceModel(torch.nn.Module):
         hs, reference, _, _, _ = self._gd.transformer(
             srcs, masks, None, poss, None, None, text_dict
         )
+        return hs, reference, image_sizes, batched_inputs, text_dict
+
+    @torch.no_grad()
+    def forward(self, batched_inputs):
+        hs, reference, image_sizes, batched_inputs, text_dict = self._extract_hs_and_ref(batched_inputs)
+        device = self.device
 
         hs_last = hs[-1]   # [B, nq, D]
         B, nq, D = hs_last.shape
 
-        # NSPS 推理：逐 query 路由 → 回退式判决
-        Z_all = hs_last.reshape(B * nq, D)  # [B*nq, D]
-        result_dict = self.nsps.inference_batched(Z_all)
+        # GD class_embed: per-query objectness (视觉-文本对比分数)
+        gd_logits = self._gd.class_embed[-1](hs_last, text_dict)  # [B, nq, text_len]
+        gd_objectness = gd_logits.max(dim=-1).values.sigmoid()    # [B, nq]
 
-        # 将 NSPS 输出转回 detectron2 结果格式
-        # 为每个 query 构造 pred_logits: 采纳的用置信度，拒识的用 0
-        task_ids = result_dict["task_ids"]    # [B*nq]
-        class_ids = result_dict["class_ids"]  # [B*nq]
-        probs = result_dict["probs"]          # [B*nq]
-        rejected = result_dict["rejected"]     # [B*nq]
+        # image-level 均值特征做路由
+        Z_img = hs_last.mean(dim=1)  # [B, D]
+        result_dict = self.nsps.inference_batched(Z_img)
 
-        # 获取全局类别总数
-        global_cls_map = self.nsps.get_global_class_mapping()
-        total_classes = max((k[1] + 1 for k in global_cls_map), default=1)
-        # 将 (task_id, local_cls) → global_cls 偏移映射
-        task_offsets = {}
-        offset = 0
-        for meta in self.nsps.task_meta:
-            task_offsets[meta["task_id"]] = offset
-            offset += meta["num_classes"]
+        task_ids = result_dict["task_ids"]
+        rejected = result_dict["rejected"]
 
-        pred_logits = torch.zeros(B * nq, max(total_classes, 1), device=device)
-        for i in range(B * nq):
-            if not rejected[i]:
-                tid = task_ids[i].item()
-                lid = class_ids[i].item()
-                g_cls = task_offsets.get(tid, 0) + lid
-                if g_cls < pred_logits.shape[1]:
-                    pred_logits[i, g_cls] = probs[i]
-
-        pred_logits = pred_logits.reshape(B, nq, -1)
-
-        # 使用 GroundingDINO 的 box 输出
         last_ref = reference[-2]
         delta_unsig = self._gd.bbox_embed[-1](hs_last)
-        pred_boxes = (delta_unsig + inverse_sigmoid(last_ref)).sigmoid()  # [B, nq, 4]
+        pred_boxes = (delta_unsig + inverse_sigmoid(last_ref)).sigmoid()
 
-        # 标准 detectron2 后处理
         processed = []
         select_n = getattr(self._gd, 'select_box_nums_for_evaluation', 300)
-        for i, (img_logits, img_boxes, img_size) in enumerate(
-            zip(pred_logits, pred_boxes, image_sizes)
-        ):
-            # Top-K 选择
-            scores_flat = img_logits.reshape(-1)
-            topk_n = min(select_n, scores_flat.shape[0])
-            _, topk_idx = scores_flat.topk(topk_n)
-            q_idx = topk_idx // img_logits.shape[1]
-            c_idx = topk_idx % img_logits.shape[1]
-            scores_sel = scores_flat[topk_idx]
-            boxes_sel = img_boxes[q_idx]
 
-            inst = Instances(img_size)
-            inst.pred_boxes = Boxes(box_cxcywh_to_xyxy(boxes_sel))
-            inst.pred_boxes.scale(scale_x=img_size[1], scale_y=img_size[0])
-            inst.scores = scores_sel
-            inst.pred_classes = c_idx
+        for i in range(B):
+            img_size = image_sizes[i]
+            img_boxes = pred_boxes[i]
+            objectness = gd_objectness[i]  # [nq]
+
+            if rejected[i]:
+                inst = Instances(img_size)
+                inst.pred_boxes = Boxes(torch.zeros(0, 4, device=device))
+                inst.scores = torch.zeros(0, device=device)
+                inst.pred_classes = torch.zeros(0, dtype=torch.long, device=device)
+            else:
+                tid = task_ids[i].item()
+                ncrn = self.nsps.consequents[tid]
+                query_feats = hs_last[i]
+                y_hat = ncrn(query_feats)  # [nq, C_task]
+
+                if self._eval_task_idx is not None and self._eval_num_classes is not None:
+                    num_cls = self._eval_num_classes
+                else:
+                    num_cls = y_hat.shape[1]
+
+                ncrn_probs = y_hat[:, :num_cls]
+                img_logits = ncrn_probs * objectness.unsqueeze(-1)
+
+                scores_flat = img_logits.reshape(-1)
+                topk_n = min(select_n, scores_flat.shape[0])
+                _, topk_idx = scores_flat.topk(topk_n)
+                q_idx = topk_idx // num_cls
+                c_idx = topk_idx % num_cls
+                scores_sel = scores_flat[topk_idx]
+                boxes_sel = img_boxes[q_idx]
+
+                inst = Instances(img_size)
+                inst.pred_boxes = Boxes(box_cxcywh_to_xyxy(boxes_sel))
+                inst.pred_boxes.scale(scale_x=img_size[1], scale_y=img_size[0])
+                inst.scores = scores_sel
+                inst.pred_classes = c_idx
 
             inp = batched_inputs[i]
             h = inp.get("height", img_size[0])
@@ -475,6 +520,14 @@ def do_train(args):
     device = auto_device()
     logger.info(f"设备: {device}")
 
+    # TaskMemory 必须在 load_grounding_dino 之前设置（apply_lora 依赖 task_mapping）
+    task_mapping = (
+        ODINW_OVERLAPPED_FILE_MAPPING
+        if 'odinwo' in args.config_file
+        else ODINW_13_FILE_MAPPING
+    )
+    TaskMemory().task_mapping = task_mapping
+
     # 加载 GroundingDINO（冻结）
     gd_model = load_grounding_dino(
         args.model_config_file,
@@ -502,7 +555,7 @@ def do_train(args):
     nsps = NSPSSystem(
         feat_dim=getattr(ncrn_cfg, 'ncrn_feat_dim', 256),
         concepts_per_task=getattr(ncrn_cfg, 'ncrn_init_active', 64),
-        rules_per_class=getattr(ncrn_cfg, 'ncrn_num_rules', 8),
+        rules_per_class=getattr(ncrn_cfg, 'ncrn_num_rules', 3),
         lambda_l1=getattr(ncrn_cfg, 'ncrn_lambda_l1', 1e-3),
         lambda_conflict=getattr(ncrn_cfg, 'ncrn_lambda_conflict', 1e-2),
         top_k=getattr(ncrn_cfg, 'nsps_top_k', 3),
@@ -520,15 +573,8 @@ def do_train(args):
             logger.warning(f"无法恢复 checkpoint ({e})，从头开始")
             start_task = 0
 
-    task_mapping = (
-        ODINW_OVERLAPPED_FILE_MAPPING
-        if 'odinwo' in args.config_file
-        else ODINW_13_FILE_MAPPING
-    )
-    TaskMemory().task_mapping = task_mapping
-
-    nsps_epochs = getattr(ncrn_cfg, 'nsps_epochs', 50)
-    nsps_lr = getattr(ncrn_cfg, 'nsps_lr', 0.001)
+    nsps_epochs = getattr(ncrn_cfg, 'nsps_epochs', 100)
+    nsps_lr = getattr(ncrn_cfg, 'nsps_lr', 0.003)
     max_samples = getattr(ncrn_cfg, 'nsps_max_samples', 500)
 
     all_task_infos = []
@@ -547,7 +593,7 @@ def do_train(args):
         cfg.train.output_dir = os.path.join(args.output_dir, cfg.train.output_dir)
         PathManager.mkdirs(cfg.train.output_dir)
 
-        class_names = cfg.dataloader.train.mapper.categories_names
+        class_names = list(cfg.dataloader.train.mapper.categories_names)
 
         try:
             info = run_nsps_add_task(
@@ -586,6 +632,15 @@ def do_eval(args, nsps: NSPSSystem, gd_model):
     device = auto_device()
     ncrn_cfg = SLConfig.fromfile(args.model_config_file)
 
+    # 确保 TaskMemory.task_mapping 已设置（eval-only 模式需要）
+    if TaskMemory().task_mapping is None:
+        task_mapping = (
+            ODINW_OVERLAPPED_FILE_MAPPING
+            if 'odinwo' in args.config_file
+            else ODINW_13_FILE_MAPPING
+        )
+        TaskMemory().task_mapping = task_mapping
+
     # 如果是 eval-only，从 checkpoint 重新加载 NSPS
     if nsps is None:
         nsps = NSPSSystem(
@@ -617,11 +672,25 @@ def do_eval(args, nsps: NSPSSystem, gd_model):
     if os.path.exists(coco_cfg):
         eval_paths.append(coco_cfg)
 
+    # 训练时的任务配置排序（与 do_train 一致）
+    train_config_dir = os.path.join(args.config_file, "for_train")
+    train_configs_sorted = sorted(glob.glob(os.path.join(train_config_dir, "*.py")))
+    train_task_stems = [Path(p).stem for p in train_configs_sorted]
+
     all_results = {}
 
     for cfg_path in eval_paths:
         dataset_name = Path(cfg_path).stem
         logger.info(f"\n[评估] {dataset_name}")
+
+        # 匹配评估数据集与训练任务索引
+        if dataset_name in train_task_stems:
+            task_idx = train_task_stems.index(dataset_name)
+            inference_model.set_eval_task(task_idx)
+            logger.info(f"  → 映射到 Task {task_idx} (局部 {nsps.task_meta[task_idx]['num_classes']} 类)")
+        else:
+            inference_model.set_eval_task(None)
+            logger.info(f"  → 未匹配训练任务，使用全局类别映射")
 
         try:
             cfg = LazyConfig.load(cfg_path)
